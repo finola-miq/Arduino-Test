@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RFID Color Display (Web Serial)</title>
+  <style>
+    :root { --bg: #000; --text:#fff; }
+    html, body {
+      margin:0; height:100%; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Noto Sans", Arial;
+    }
+    .toolbar {
+      position: fixed; left: 50%; transform: translateX(-50%);
+      bottom: 1rem; display:flex; gap:.5rem; align-items:center;
+      background: rgba(255,255,255,.1); padding:.5rem .75rem; border-radius: 12px;
+      backdrop-filter: blur(8px);
+    }
+    button, input {
+      border:0; border-radius:10px; padding:.55rem .8rem; font-weight:600;
+      background: rgba(255,255,255,.15); color:#fff; cursor:pointer;
+    }
+    button.primary{ background: rgba(0,153,255,.8) }
+    button.danger{ background: rgba(239,68,68,.9) }
+    button:disabled{ opacity:.6; cursor:not-allowed }
+    .hud {
+      position:absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      text-align:center;
+    }
+    .uid { font-size: clamp(20px, 6vw, 90px); letter-spacing: .04em; font-weight:800; }
+    .colorName { font-size: clamp(16px, 3.5vw, 48px); opacity:.9; margin-top:.25em }
+    .status { position: fixed; left:1rem; top:1rem; font-size:14px; opacity:.85 }
+    .log {
+      position: fixed; right:1rem; bottom: 4.8rem; width:min(520px, 90vw); max-height: 40vh;
+      overflow:auto; white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace;
+      background: rgba(0,0,0,.5); border: 1px solid rgba(255,255,255,.15); padding:.5rem .65rem; border-radius: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="status" id="status">Not connected</div>
+  <div class="hud">
+    <div class="uid" id="uid">—</div>
+    <div class="colorName" id="color">Press Connect</div>
+  </div>
+  <div class="log" id="log"></div>
+
+  <div class="toolbar">
+    <button id="btnConnect" class="primary">🔌 Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+    <button id="btnFullscreen">Fullscreen</button>
+    <input id="customUid" placeholder="Type UID (e.g. F45B3200)" />
+    <button id="btnSim">Simulate</button>
+  </div>
+
+<script>
+const UID_COLORS = {
+  "F45B320": "green",
+  "4343A9D": "blue"
+};
+const DEFAULT_UNKNOWN = "white";
+
+const COLOR_TO_CSS = (name)=>{
+  switch((name||"").toLowerCase()){
+    case "green": return "radial-gradient(circle at 20% 20%, #d1fae5, #34d399, #10b981)";
+    case "blue":  return "radial-gradient(circle at 80% 20%, #dbeafe, #60a5fa, #3b82f6)";
+    case "red":   return "radial-gradient(circle at 50% 50%, #fee2e2, #f87171, #ef4444)";
+    case "white": return "#ffffff";
+    case "gray":  return "#111827";
+    default: return name;
+  }
+};
+
+let port, reader, inputDone;
+const dec = new TextDecoder();
+
+const el = (id)=>document.getElementById(id);
+const log = (...a)=>{
+  const box = el('log');
+  const time = new Date().toLocaleTimeString();
+  box.textContent += '['+time+'] ' + a.join(' ') + '\n';
+  box.scrollTop = box.scrollHeight;
+};
+function setStatus(s){ el('status').textContent = s; }
+
+function normalizeUid(raw){
+  let u = raw.trim();
+  if (u.startsWith("TAG:")) u = u.slice(4);
+  u = u.replace(/\s+/g, "");
+  return u.toUpperCase();
+}
+function lookupColor(uid){
+  if (UID_COLORS[uid]) return UID_COLORS[uid];
+  for (const key of Object.keys(UID_COLORS)){
+    if (uid.startsWith(key)) return UID_COLORS[key];
+  }
+  return DEFAULT_UNKNOWN;
+}
+function applyColor(uid, colorName){
+  document.documentElement.style.setProperty('--bg', COLOR_TO_CSS(colorName));
+  el('uid').textContent = uid || '—';
+  el('color').textContent = colorName;
+  log(uid ? `UID ${uid} -> ${colorName}` : `Color -> ${colorName}`);
+}
+
+async function readLoop(){
+  const readerLocal = port.readable.getReader();
+  reader = readerLocal;
+  let buf = "";
+  inputDone = (async()=>{
+    try{
+      while(true){
+        const {value, done} = await readerLocal.read();
+        if (done) break;
+        if (value){
+          const chunk = dec.decode(value);
+          buf += chunk;
+          let parts = buf.split(/\n/);
+          buf = parts.pop();
+          for (const raw of parts){
+            const line = raw.replace(/\r/g,'').trim();
+            if (!line) continue;
+            onLine(line);
+          }
+        }
+      }
+    } catch(e) {
+      log('Read error:', e.message);
+    }
+  })();
+}
+
+function onLine(line){
+  log('<- ' + line);
+  const maybeUid = normalizeUid(line);
+  if (/^[0-9A-F]+$/.test(maybeUid) && maybeUid.length >= 4){
+    const color = lookupColor(maybeUid);
+    applyColor(maybeUid, color);
+    return;
+  }
+  if (line === 'STATE:ON') applyColor('[STATE]', 'green');
+  else if (line === 'STATE:OFF') applyColor('[STATE]', 'gray');
+}
+
+async function connect(){
+  if (!("serial" in navigator)) {
+    alert("Web Serial not supported. Use Chrome/Edge on desktop over HTTPS or localhost.");
+    return;
+  }
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    setStatus(`Connected @ 115200`);
+    el('btnConnect').disabled = true;
+    el('btnDisconnect').disabled = false;
+    await readLoop();
+  } catch(e){
+    log('ERROR opening port: ' + e.message);
+  }
+}
+async function disconnect(){
+  try{
+    if(reader){ await reader.cancel(); await inputDone; reader.releaseLock(); }
+    await port.close();
+  } catch(e){
+    log('ERROR closing port: ' + e.message);
+  } finally {
+    setStatus('Not connected');
+    el('btnConnect').disabled = false;
+    el('btnDisconnect').disabled = true;
+  }
+}
+
+async function goFullscreen(){
+  if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+  else await document.exitFullscreen();
+}
+function simulate(){
+  const raw = el('customUid').value.trim();
+  if (!raw) return;
+  const uid = normalizeUid(raw);
+  const color = lookupColor(uid);
+  applyColor(uid, color);
+}
+
+el('btnConnect').addEventListener('click', connect);
+el('btnDisconnect').addEventListener('click', disconnect);
+el('btnFullscreen').addEventListener('click', goFullscreen);
+el('btnSim').addEventListener('click', simulate);
+
+document.addEventListener('keydown', (e)=>{
+  if (e.key === 'Escape' && document.fullscreenElement) document.exitFullscreen();
+});
+navigator.serial?.addEventListener('disconnect', ()=>{
+  log('Device disconnected.');
+  setStatus('Not connected');
+  el('btnConnect').disabled = false;
+  el('btnDisconnect').disabled = true;
+});
+</script>
+</body>
+</html>
