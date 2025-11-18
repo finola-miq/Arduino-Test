@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Arduino Serial Control (Web Serial)</title>
+  <style>
+    :root{
+      --ok: #16a34a;
+      --warn:#eab308;
+      --err:#dc2626;
+      --bg-on: radial-gradient(circle at 20% 20%, #d1fae5, #a7f3d0, #6ee7b7);
+      --bg-off: radial-gradient(circle at 80% 20%, #e5e7eb, #d1d5db, #9ca3af);
+    }
+    html,body{
+      margin:0;height:100%;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      background: var(--bg-off);
+      transition: background 500ms ease;
+    }
+    .app{
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 1rem 1.2rem;
+      background: rgba(255,255,255,0.7);
+      backdrop-filter: blur(6px);
+      border-radius: 16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,0.1);
+    }
+    h1{margin:0 0 .5rem 0}
+    .row{display:flex; gap:.5rem; flex-wrap: wrap; align-items: center}
+    button{
+      cursor: pointer;
+      border: 0;
+      padding: .7rem 1rem;
+      border-radius: 10px;
+      font-weight: 600;
+      box-shadow: 0 6px 16px rgba(0,0,0,.08);
+    }
+    button.primary{ background:#2563eb; color:#fff }
+    button.safe{ background:#10b981; color:#fff}
+    button.danger{ background:#ef4444; color:#fff}
+    button.secondary{ background:#e5e7eb; }
+    button:disabled{ opacity:.5; cursor:not-allowed }
+    .status{ font-weight:700 }
+    .dot{ display:inline-block; width:.6rem;height:.6rem; border-radius:50%; vertical-align:middle; margin-right:.4rem; background:#9ca3af}
+    .dot.ok{ background: var(--ok) }
+    .dot.err{ background: var(--err) }
+    .log{
+      margin-top: 1rem;
+      background: #0b1020;
+      color: #d1d5db;
+      padding: .75rem;
+      border-radius: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      max-height: 45vh;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+    .kbd{ padding:.2rem .4rem; border:1px solid #cbd5e1; border-bottom-width:2px; border-radius:6px; background:#f8fafc; font-family:inherit }
+    .hint{ color:#374151; font-size:.92rem }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1>Arduino Serial Control</h1>
+    <p class="hint">Chrome/Edge on desktop with HTTPS required. Click <em>Connect</em>, then use buttons or send custom text lines that end with <code>\\n</code>. The Arduino sketch echoes <code>STATE:ON</code> / <code>STATE:OFF</code> which this page uses to change background and play a sound.</p>
+
+    <div class="row" style="margin:.5rem 0 1rem">
+      <button id="btnConnect" class="primary">🔌 Connect</button>
+      <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
+      <span id="conn" class="status"><span class="dot"></span><span id="connText">Not connected</span></span>
+    </div>
+
+    <div class="row" style="margin:.25rem 0 1rem">
+      <button id="btnOn" class="safe" disabled>Turn LED ON (key123)</button>
+      <button id="btnOff" class="danger" disabled>Turn LED OFF (key321)</button>
+      <input id="txt" class="kbd" placeholder="Type a command (e.g., status)" size="26" />
+      <button id="btnSend" class="secondary" disabled>Send</button>
+    </div>
+
+    <audio id="sndOn">
+      <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYAAAAA/////wAAAAAA" type="audio/wav">
+    </audio>
+    <audio id="sndOff">
+      <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYAAAAA/////wAAAAAA" type="audio/wav">
+    </audio>
+
+    <div class="log" id="log"></div>
+  </div>
+
+<script>
+let port, reader, inputDone, outputDone, inputStream, outputStream;
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+const el = (id)=>document.getElementById(id);
+const log = (...a)=>{
+  const box = el('log');
+  const time = new Date().toLocaleTimeString();
+  box.textContent += '['+time+'] ' + a.join(' ') + '\\n';
+  box.scrollTop = box.scrollHeight;
+};
+
+function setConnected(uiConnected){
+  el('btnDisconnect').disabled = !uiConnected;
+  el('btnOn').disabled = !uiConnected;
+  el('btnOff').disabled = !uiConnected;
+  el('btnSend').disabled = !uiConnected;
+  const dot = document.querySelector('.dot');
+  const connText = el('connText');
+  if(uiConnected){
+    dot.classList.add('ok'); dot.classList.remove('err');
+    connText.textContent = 'Connected';
+  }else{
+    dot.classList.remove('ok'); dot.classList.remove('err');
+    connText.textContent = 'Not connected';
+  }
+}
+
+async function connect() {
+  if (!("serial" in navigator)) {
+    alert("Web Serial not supported in this browser. Use Chrome/Edge on desktop over HTTPS.");
+    return;
+  }
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    ({ readable: inputStream, writable: outputStream } = port);
+    reader = inputStream.getReader();
+    readLoop();
+    setConnected(true);
+    log('Opened serial port @115200');
+  }catch(err){
+    log('ERROR opening port:', err.message);
+  }
+}
+
+async function disconnect(){
+  try{
+    if(reader){
+      await reader.cancel();
+      await inputDone;
+      reader.releaseLock();
+    }
+    if(outputStream){
+      await outputStream.getWriter().close();
+      await outputDone;
+    }
+    await port.close();
+    log('Serial port closed.');
+  }catch(err){
+    log('ERROR closing port:', err.message);
+  }finally{
+    setConnected(false);
+  }
+}
+
+// Read loop: accumulates lines and reacts to Arduino messages
+let lineBuf = "";
+async function readLoop(){
+  inputDone = (async () => {
+    try{
+      while(true){
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          const chunk = dec.decode(value);
+          lineBuf += chunk;
+          // split on LF and process
+          let lines = lineBuf.split(/\\n/);
+          lineBuf = lines.pop(); // keep last partial
+          for (const lRaw of lines){
+            const l = lRaw.replace(/\\r/g,'').trim();
+            if(!l) continue;
+            onLine(l);
+          }
+        }
+      }
+    } catch(e) {
+      log('Read error:', e.message);
+    }
+  })();
+}
+
+function onLine(l){
+  log('<- ', l);
+  // React to state messages from Arduino
+  if (l === 'STATE:ON'){
+    document.body.style.background = getComputedStyle(document.documentElement).getPropertyValue('--bg-on');
+    el('sndOn').play().catch(()=>{});
+  } else if (l === 'STATE:OFF'){
+    document.body.style.background = getComputedStyle(document.documentElement).getPropertyValue('--bg-off');
+    el('sndOff').play().catch(()=>{});
+  }
+  // Example of "switching screens": just toggle a CSS class or navigate.
+  // You can add more actions here based on custom messages from Arduino.
+}
+
+async function sendLine(s){
+  if(!outputStream){ log('Not connected'); return; }
+  const writer = outputStream.getWriter();
+  await writer.write(enc.encode(s + "\\n"));
+  writer.releaseLock();
+  log('-> ', s);
+}
+
+// UI wiring
+el('btnConnect').addEventListener('click', connect);
+el('btnDisconnect').addEventListener('click', disconnect);
+el('btnOn').addEventListener('click', ()=> sendLine('key123'));
+el('btnOff').addEventListener('click', ()=> sendLine('key321'));
+el('btnSend').addEventListener('click', ()=> {
+  const v = el('txt').value.trim();
+  if(v) sendLine(v);
+  el('txt').value = '';
+});
+el('txt').addEventListener('keydown', (e)=>{
+  if(e.key === 'Enter') el('btnSend').click();
+});
+
+// Auto-reconnect prompt on detach
+navigator.serial?.addEventListener('disconnect', () => {
+  log('Device disconnected.');
+  setConnected(false);
+});
+</script>
+</body>
+</html>
